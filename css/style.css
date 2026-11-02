@@ -87,6 +87,8 @@ p:last-child{margin-bottom:0}
 .projects .row{grid-template-columns:1fr auto auto;grid-template-areas:"n g l"}
 .projects .n{grid-area:n}.projects .g{grid-area:g}.projects .l{grid-area:l}
 
+.copy{font:inherit;background:none;border:0;padding:0;color:var(--dim);cursor:pointer}
+.copy:hover{color:var(--tan)}
 .links{list-style:none;margin:0;padding:0;display:flex;flex-wrap:wrap;gap:.5rem 1.4rem}
 footer{padding:0 16px 40px;text-align:center;color:var(--dim);font-size:.85rem}
 footer span{background:var(--panel);padding:.35rem .8rem}

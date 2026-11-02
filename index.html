@@ -68,7 +68,7 @@
       <h2 id="h-contact">[ contact ]</h2>
       <ul class="links">
         <li><a href="https://github.com/freenonchi" rel="me noopener">[ github ]</a></li>
-        <li><a href="mailto:contact@enes.com.br">[ email ]</a></li>
+        <li><a href="mailto:freenonchi0.1@gmail.com">[ freenonchi0.1@gmail.com ]</a> <button type="button" class="copy" data-copy="freenonchi0.1@gmail.com" hidden>[ copy ]</button></li>
       </ul>
     </section>
 
@@ -81,5 +81,22 @@
 
 <script src="js/river.js" defer></script>
 <script src="js/smooth.js" defer></script>
+<script>
+(function () {
+  var b = document.querySelector('[data-copy]');
+  if (!b) return;
+  b.hidden = false;
+  b.addEventListener('click', function () {
+    var v = b.getAttribute('data-copy');
+    var done = function () {
+      b.textContent = '[ copied ]';
+      setTimeout(function () { b.textContent = '[ copy ]'; }, 1800);
+    };
+    var fallback = function () { window.prompt('Copy the address:', v); };
+    if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(v).then(done, fallback);
+    else fallback();
+  });
+})();
+</script>
 </body>
 </html>
