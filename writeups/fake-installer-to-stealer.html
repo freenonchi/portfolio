@@ -1,0 +1,279 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>From a fake game installer to a stealer · ff_lixo1</title>
+<meta name="description" content="Teardown of a three-stage Windows campaign: a Node.js dropper, a Rust RAT and a C++ infostealer, with the C2 protocol, a sandbox-evasion check and detection ideas.">
+<meta name="theme-color" content="#0b0b09">
+<meta property="og:type" content="article">
+<meta property="og:title" content="From a fake game installer to a stealer">
+<meta property="og:description" content="Teardown of a three-stage Windows campaign: a Node.js dropper, a Rust RAT and a C++ infostealer, with the C2 protocol, a sandbox-evasion check and detection ideas.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' fill='%230b0b09'/%3E%3Ctext x='16' y='22' font-family='monospace' font-size='17' text-anchor='middle' fill='%23d1b06c'%3Eff%3C/text%3E%3C/svg%3E">
+<link rel="stylesheet" href="../css/style.css">
+</head>
+<body id="top" data-river="wide">
+<a class="skip" href="#post">skip to article</a>
+<canvas id="river" aria-hidden="true"></canvas>
+
+<header class="bar">
+  <a href="../index.html">[ ff_lixo1 ]</a>
+  <a href="../index.html#writeups">[ &lt; writeups ]</a>
+</header>
+
+<main>
+  <div class="wrap">
+
+    <div class="page-head">
+      <div class="frame">
+        <p class="kicker">// writeup · malware analysis</p>
+        <h1>From a fake game installer to a stealer</h1>
+        <ul class="post-meta">
+          <li><b>date:</b> <time datetime="2026-11-02">2026-11-02</time></li>
+          <li><b>tag:</b> malware</li>
+          <li><b>read:</b> 12 min</li>
+        </ul>
+      </div>
+    </div>
+
+    <article class="post" id="post">
+      <h2>summary</h2>
+      <p>I got a 209 MB zip that claimed to be a game installer. It turned out to be three stages deep: a Node.js dropper, a Rust remote access trojan (RAT), and a C++ infostealer that calls itself "Mops Stealer V3". This is how I took it apart, what I got wrong along the way, and what a defender can use from it.</p>
+      <p>Everything below is static analysis, plus a few runs of the RAT inside an isolated VM. The stealer itself was never executed anywhere. Indicators are defanged, so replace <code>[.]</code> with <code>.</code> before you hunt for them.</p>
+
+      <h2>how I stayed safe</h2>
+      <ul>
+        <li>Nothing from the zip was ever run on my own machine, so nothing was stolen from it.</li>
+        <li>Analysis ran on Linux with Python (<code>pefile</code>, <code>capstone</code>, <code>unicorn</code>), radare2 and Ghidra in headless mode.</li>
+        <li>The RAT ran only in a Windows 10 VM on an isolated network. The host dropped everything except the command server's ports, and DNS answered for one name only.</li>
+        <li>Anything received from the command server was treated as inert bytes.</li>
+      </ul>
+      <div class="callout"><b>note:</b> to read the task queue I connected to the live command server with a throwaway fake client. I only read and never acted on what came back. Touching live attacker infrastructure can carry legal and safety risks, so think it through before repeating it.</div>
+
+      <h2>the whole chain at a glance</h2>
+      <p>Read it top to bottom. Each dashed vertical line is a program, and arrows are things one program sends or does to another. The detail for each numbered step is in the sections below.</p>
+      <figure class="diagram">
+<svg viewBox="0 0 780 1410" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="dg-t dg-d">
+<title id="dg-t">Infection chain from Setup.exe to the stealer</title>
+<desc id="dg-d">Sequence of the campaign. 1 the victim runs Setup.exe. 2 it runs hidden PowerShell to add Defender exclusions. 3 it XOR-decrypts an embedded PE. 4 it drops and starts that RAT as RuntimeBroker.exe. 5 the RAT checks for a sandbox and quietly exits in a VM. 6 to 9 the RAT registers on the command server over a WebSocket on port 406 and receives a task to run the Stealer module. 10 to 11 it downloads the roughly 1.1 MB stealer DLL over HTTP on port 408. 12 it loads the DLL reflectively in memory. 13 the stealer collects browser, wallet and session data into an in-memory ZIP. 14 to 16 it uploads the ZIP over raw TCP on port 1488 after an auth_ok reply. 17 it terminates its own host process, which is most likely a separate process the RAT injected. 18 the RAT reports the task done on port 406 and keeps running.</desc>
+<defs><marker id="ah-out" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 1 L10 5 L0 9 z" class="dg-ah-out"/></marker><marker id="ah-in" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 1 L10 5 L0 9 z" class="dg-ah-in"/></marker></defs>
+<rect x="-3.0" y="8" width="130.0" height="44" class="dg-head dg-ha"/>
+<text x="62" y="26" text-anchor="middle" class="dg-hd">victim</text>
+<text x="62" y="44" text-anchor="middle" class="dg-dim">runs the &quot;game&quot;</text>
+<rect x="123.4" y="8" width="137.2" height="44" class="dg-head dg-hb"/>
+<text x="192" y="26" text-anchor="middle" class="dg-hd">Setup.exe</text>
+<text x="192" y="44" text-anchor="middle" class="dg-dim">stage 1, Node.js</text>
+<rect x="277.8" y="8" width="144.4" height="44" class="dg-head dg-hc"/>
+<text x="350" y="26" text-anchor="middle" class="dg-hd">RuntimeBroker.exe</text>
+<text x="350" y="44" text-anchor="middle" class="dg-dim">stage 2, Rust RAT</text>
+<rect x="457.8" y="8" width="108.4" height="44" class="dg-head dg-hd"/>
+<text x="512" y="26" text-anchor="middle" class="dg-hd">Stealer DLL</text>
+<text x="512" y="44" text-anchor="middle" class="dg-dim">stage 3, C++</text>
+<rect x="627.8" y="8" width="144.4" height="44" class="dg-head dg-he"/>
+<text x="700" y="26" text-anchor="middle" class="dg-hd">C2 server</text>
+<text x="700" y="44" text-anchor="middle" class="dg-dim">mopsikimilie[.]cc</text>
+<line x1="62" y1="54.0" x2="62" y2="190.0" class="dg-life"/>
+<line x1="192" y1="54.0" x2="192" y2="380.0" class="dg-life"/>
+<line x1="350" y1="362.0" x2="350" y2="1406.0" class="dg-life"/>
+<line x1="512" y1="890.0" x2="512" y2="1246.0" class="dg-life"/>
+<line x1="700" y1="54.0" x2="700" y2="1406.0" class="dg-life"/>
+<line x1="8" y1="132" x2="772" y2="132" class="dg-phase"/>
+<text x="8" y="127" class="dg-ph">[ 1 install ]</text>
+<text x="127.0" y="165.0" text-anchor="middle" class="dg-t">1 run Setup.exe</text>
+<line x1="66.0" y1="176.0" x2="188.0" y2="176.0" class="dg-out" marker-end="url(#ah-out)"/>
+<rect x="99.2" y="202.0" width="185.6" height="42.0" class="dg-box"/>
+<text x="192" y="221.0" text-anchor="middle" class="dg-t">2 hidden PowerShell:</text>
+<text x="192" y="235.0" text-anchor="middle" class="dg-t">add Defender exclusions</text>
+<rect x="95.6" y="266.0" width="192.8" height="42.0" class="dg-box"/>
+<text x="192" y="285.0" text-anchor="middle" class="dg-t">3 XOR-decrypt payload.js</text>
+<text x="192" y="299.0" text-anchor="middle" class="dg-t">blob, result starts MZ</text>
+<text x="271.0" y="341.0" text-anchor="middle" class="dg-t">4 drop + start RAT</text>
+<text x="271.0" y="355.0" text-anchor="middle" class="dg-t">as RuntimeBroker.exe</text>
+<line x1="196.0" y1="366.0" x2="346.0" y2="366.0" class="dg-out" marker-end="url(#ah-out)"/>
+<line x1="8" y1="406" x2="772" y2="406" class="dg-phase"/>
+<text x="8" y="401" class="dg-ph">[ 2 check in ]</text>
+<rect x="253.6" y="428.0" width="192.8" height="56.0" class="dg-box"/>
+<text x="350" y="447.0" text-anchor="middle" class="dg-t">5 anti-sandbox: GPU name</text>
+<text x="350" y="461.0" text-anchor="middle" class="dg-t">list, CPUID check</text>
+<text x="350" y="475.0" text-anchor="middle" class="dg-t">(quietly exits in a VM)</text>
+<text x="525.0" y="517.0" text-anchor="middle" class="dg-t">6 :406 WebSocket</text>
+<text x="525.0" y="531.0" text-anchor="middle" class="dg-t">ready;5197705037;</text>
+<line x1="354.0" y1="542.0" x2="696.0" y2="542.0" class="dg-out" marker-end="url(#ah-out)"/>
+<text x="525.0" y="579.0" text-anchor="middle" class="dg-t">7 getinfo</text>
+<line x1="696.0" y1="590.0" x2="354.0" y2="590.0" class="dg-in" marker-end="url(#ah-in)"/>
+<text x="525.0" y="627.0" text-anchor="middle" class="dg-t">8 info;host;user;os;arch;ver;</text>
+<line x1="354.0" y1="638.0" x2="696.0" y2="638.0" class="dg-out" marker-end="url(#ah-out)"/>
+<text x="525.0" y="675.0" text-anchor="middle" class="dg-t">9 task;createtask;Stealer;...</text>
+<line x1="696.0" y1="686.0" x2="354.0" y2="686.0" class="dg-in" marker-end="url(#ah-in)"/>
+<line x1="8" y1="726" x2="772" y2="726" class="dg-phase"/>
+<text x="8" y="721" class="dg-ph">[ 3 fetch the module ]</text>
+<text x="525.0" y="759.0" text-anchor="middle" class="dg-t">10 :408 HTTP</text>
+<text x="525.0" y="773.0" text-anchor="middle" class="dg-t">GET /task/Stealer</text>
+<line x1="354.0" y1="784.0" x2="696.0" y2="784.0" class="dg-out" marker-end="url(#ah-out)"/>
+<text x="525.0" y="821.0" text-anchor="middle" class="dg-t">11 200 OK, 1,120,256 byte DLL (MZ)</text>
+<line x1="696.0" y1="832.0" x2="354.0" y2="832.0" class="dg-in" marker-end="url(#ah-in)"/>
+<text x="431.0" y="869.0" text-anchor="middle" class="dg-t">12 reflective load,</text>
+<text x="431.0" y="883.0" text-anchor="middle" class="dg-t">run in memory</text>
+<line x1="354.0" y1="894.0" x2="508.0" y2="894.0" class="dg-out" marker-end="url(#ah-out)"/>
+<line x1="8" y1="934" x2="772" y2="934" class="dg-phase"/>
+<text x="8" y="929" class="dg-ph">[ 4 steal and upload ]</text>
+<rect x="408.4" y="956.0" width="207.2" height="56.0" class="dg-box"/>
+<text x="512" y="975.0" text-anchor="middle" class="dg-t">13 grab browsers, wallets,</text>
+<text x="512" y="989.0" text-anchor="middle" class="dg-t">sessions, screenshot;</text>
+<text x="512" y="1003.0" text-anchor="middle" class="dg-t">build ZIP in memory</text>
+<text x="606.0" y="1045.0" text-anchor="middle" class="dg-t">14 :1488 raw TCP</text>
+<text x="606.0" y="1059.0" text-anchor="middle" class="dg-t">&lt;volserial&gt;stealer;</text>
+<line x1="516.0" y1="1070.0" x2="696.0" y2="1070.0" class="dg-out" marker-end="url(#ah-out)"/>
+<text x="606.0" y="1107.0" text-anchor="middle" class="dg-t">15 auth_ok</text>
+<line x1="696.0" y1="1118.0" x2="516.0" y2="1118.0" class="dg-in" marker-end="url(#ah-in)"/>
+<text x="606.0" y="1155.0" text-anchor="middle" class="dg-t">16 8-byte length</text>
+<text x="606.0" y="1169.0" text-anchor="middle" class="dg-t">+ ZIP bytes</text>
+<line x1="516.0" y1="1180.0" x2="696.0" y2="1180.0" class="dg-out" marker-end="url(#ah-out)"/>
+<rect x="412.0" y="1206.0" width="200.0" height="28.0" class="dg-box"/>
+<text x="512" y="1225.0" text-anchor="middle" class="dg-t">17 TerminateProcess(self)</text>
+<path d="M512 1246.0 l12 12 m0 -12 l-12 12" class="dg-x" transform="translate(-6 -6)"/>
+<line x1="8" y1="1270" x2="772" y2="1270" class="dg-phase"/>
+<text x="8" y="1265" class="dg-ph">[ 5 report ]</text>
+<text x="525.0" y="1303.0" text-anchor="middle" class="dg-t">18 :406 task_done; closetask</text>
+<line x1="354.0" y1="1314.0" x2="696.0" y2="1314.0" class="dg-out" marker-end="url(#ah-out)"/>
+<rect x="260.8" y="1340.0" width="178.4" height="42.0" class="dg-box"/>
+<text x="350" y="1359.0" text-anchor="middle" class="dg-t">RAT keeps running:</text>
+<text x="350" y="1373.0" text-anchor="middle" class="dg-t">persistence stays here</text>
+</svg>
+        <figcaption>Fig 1. Tan arrows go from the victim side to the server, green arrows are the server's replies. Steps 6 to 11 happen on ports 406 and 408, and the loot upload in steps 14 to 16 uses port 1488.</figcaption>
+      </figure>
+
+      <h2>stage 0: the bait</h2>
+      <p>The zip is 209 MB and stored without compression. Most of it is real game content, such as FMOD audio banks, which makes it look legitimate. Next to that sits <code>Setup.exe</code> at 117 MB.</p>
+      <p><code>Setup.exe</code> is a 64-bit Windows GUI program that contains the marker <code>NODE_SEA_FUSE_fce680ab2cc467b6e072b8b5df1996b2</code>. That is a Node.js single executable application, packaged with <code>vercel/pkg</code>, so a whole JavaScript program hides inside a normal-looking exe. The large overlay at the end is the bundled virtual filesystem.</p>
+
+      <h2>stage 1: the dropper</h2>
+      <p>I parsed the pkg manifest and carved out four files: <code>index.js</code>, <code>package.json</code>, <code>payload.js</code> (about 957 KB) and <code>shell.js</code>. A build path leaked in the process, <code>C:\snapshot\5197705037_640_...\payload.js</code>, and the number in it turned out to be the campaign ID.</p>
+      <p>Two things matter here:</p>
+      <ul>
+        <li>A hidden PowerShell command adds Windows Defender exclusions for the temp folder and a few <code>ProgramData</code> paths, then runs <code>gpupdate /force</code>.</li>
+        <li><code>payload.js</code> holds an object with a <code>PayloadKey</code> and about 956 KB of base64 in <code>EncryptedBytes</code>.</li>
+      </ul>
+      <p>The key is 32 characters, so I assumed AES-256 and wasted time on CBC, ECB and CTR. All garbage. It is a plain repeating-key XOR. Once decoded, the output starts with <code>MZ</code>, which is a PE file. That file is dropped as <code>C:\ProgramData\Windows\Microsoft\RuntimeBroker.exe</code>, named after a real Windows process.</p>
+
+      <h2>stage 2: the RAT</h2>
+      <p>The dropped file is a 717,312 byte Rust program compiled on 2026-10-30. Statically it only imports <code>KERNEL32.dll</code>, with no networking at all. What it does import is <code>LoadLibrary</code>, <code>GetProcAddress</code>, <code>VirtualAlloc</code>, <code>WriteProcessMemory</code> and <code>CreateProcess</code>. That combination means it resolves its real APIs at runtime and can inject code, so the interesting calls never show up in the import table. It also has a <code>.strenc</code> section for string encryption.</p>
+      <h3>cracking the strings</h3>
+      <p>There are two custom string ciphers. The main one rotates each byte right by a position-dependent amount and XORs it with a keystream. Wide strings need every other byte first:</p>
+<pre><code>def ror8(x, n):
+    n &amp;= 7
+    return ((x &gt;&gt; n) | (x &lt;&lt; (8 - n))) &amp; 0xFF
+
+def decrypt(ct):
+    return bytes(ror8(c, (i % 7) + 1) ^ ((i * 13 + 197) &amp; 0xFF)
+                 for i, c in enumerate(ct))</code></pre>
+      <p>That decoded 30 or more strings and the whole config block, which is set up by a chain of 13 small functions:</p>
+      <table>
+        <thead><tr><th>item</th><th>value</th></tr></thead>
+        <tbody>
+          <tr><td>install path</td><td><code>C:\ProgramData\Windows\Microsoft\RuntimeBroker.exe</code></td></tr>
+          <tr><td>C2 host</td><td><code>mopsikimilie[.]cc</code></td></tr>
+          <tr><td>ports</td><td>406 (control), 408 (module download)</td></tr>
+          <tr><td>campaign ID</td><td><code>5197705037</code></td></tr>
+          <tr><td>version</td><td><code>1.0.0</code></td></tr>
+        </tbody>
+      </table>
+      <p>I searched the decoded and plain strings for any second exfiltration channel, such as a Discord or Telegram webhook, Pastebin, FTP or another domain. There is none. The RAT has no theft logic of its own. It is a loader that asks the server what to run next.</p>
+      <p>A side note on tooling: I wanted r2ghidra for decompiling, but it would not build against radare2 6.0.5. I dropped it and used radare2, Unicorn and Capstone instead, and later Ghidra headless.</p>
+
+      <h2>the command server</h2>
+      <p>The domain resolves to <code>185[.]235[.]128[.]170</code>. Port 3000 is a decoy Express app that redirects everything to Google. The real services are on 406 and 408.</p>
+      <p>Port 406 is a WebSocket. The server sends <code>ping</code> and the client answers <code>pong</code>. The client registers with <code>ready;5197705037;</code>, the server asks <code>getinfo</code>, and the client replies with <code>info;&lt;host&gt;;&lt;user&gt;;&lt;os&gt;;&lt;arch&gt;;&lt;ver&gt;;</code>. Then it gets its tasks:</p>
+<pre><code>task;createtask;Stealer;task_id;ggvk8x_06r3;version;1.0.1
+task;createtask;Stealer;task_id;hwhf8d_4ngg;version;1.0.1
+task;createtask;Stealer;task_id;xnqwf7_0s1z;version;1.0.1</code></pre>
+      <p>The task carries no instructions beyond a module name, so all the stealing lives in the module. The RAT downloads it over HTTP on port 408 and then runs it. The format strings hint at a chunked transfer, though the single download I captured came back as one response.</p>
+      <h3>the 403 wall, and a wrong guess</h3>
+      <p>Downloading the module myself always returned <code>403 Access denied</code>. I tried different User-Agents, composite paths, a held-open session from the same IP and more, and some attempts hit a rate limit. I then traced the User-Agent through four nested functions in the RAT and found it is a field of a runtime context object, not a constant, so static analysis could never give me the value.</p>
+      <div class="callout"><b>correction:</b> early on I claimed the server only serves a task to the victim it was assigned to. That was wrong. A brand-new fake client got three tasks immediately, which only makes sense if they are broadcast to every bot. The 403 gate is something else, and I never worked out what.</div>
+
+      <h2>getting the stealer without running it</h2>
+      <p>Since I could not download the module, I let the RAT fetch it inside the lab VM and recorded the traffic. The catch was that the RAT kept exiting before it did anything. Procmon showed nothing because the decision is made in memory.</p>
+      <p>Breaking on <code>ExitProcess</code> in x64dbg and following references in radare2 led to one function. It asks Direct3D9 for the graphics adapter name and compares it with a blocklist, and it exits quietly on a match. The list covers the usual virtual GPUs (VMware, VirtualBox, QXL, Virtio, Hyper-V, Parallels, Citrix, the Windows software renderer) and also <code>anyrun</code>, which likely explains why public sandboxes saw nothing. A second function checks the CPUID hypervisor bit.</p>
+      <p>Spoofing the registry did not work, because the software renderer always reports its own name. In a working copy of the RAT I patched the two conditional jumps behind the GPU check so they always skip the exit. The patched RAT then beaconed, got its task, and sent <code>GET /task/Stealer</code>. The reply was a <code>200 OK</code> with <code>application/octet-stream</code>, 1,120,256 bytes, starting with <code>MZ</code>. I exported it from the packet capture. It was never run.</p>
+
+      <h2>stage 3: the stealer</h2>
+      <p>It is a 64-bit C++ DLL compiled on 2026-10-28. It is not packed and it has no exports, which fits being loaded reflectively by the RAT. Unlike the RAT its strings are plain text, so the target list reads like a menu. It labels its own report <code>- Mops Stealer V3:</code> and uses the mutex <code>Global\StealerLib</code>.</p>
+      <h3>what it goes after</h3>
+      <ul>
+        <li><b>Browsers:</b> about 46 Chromium and Gecko families. Saved logins, cards and autofill, cookies, <code>Local State</code> and history.</li>
+        <li><b>Crypto:</b> desktop wallets and wallet browser extensions, found by extension ID.</li>
+        <li><b>Sessions:</b> Telegram, Discord tokens, Steam and Viber.</li>
+        <li><b>Apps and files:</b> FileZilla, several VPN configs, AnyDesk, game launchers, a generic file grabber and a screenshot.</li>
+        <li><b>Host report:</b> OS, CPU, GPU, hardware ID, country and an affiliate or build ID.</li>
+      </ul>
+      <h3>the encryption detail I liked</h3>
+      <p>It knows three ways to recover a browser's master key: the old DPAPI key, the newer app-bound key with two DPAPI layers, and an unwrap through the Windows key storage provider using a persistent key called <code>Google Chromekey1</code>. That last one is how it gets past Chrome's app-bound protection.</p>
+      <p>What surprised me is that it never decrypts anything itself. I looked for AES tables, AES-NI instructions, carry-less multiply and a BCrypt import, and found none. My conclusion, which is an inference and not something I saw on the server, is that it ships the unlocked master keys plus the raw encrypted stores and leaves the final AES-GCM step to the operator's side.</p>
+      <h3>how the loot leaves</h3>
+      <p>Everything is packed into a ZIP in memory, and nothing is written to disk. Then the stealer sends it straight to the C2 on port 1488, using its own raw TCP socket with no TLS and no HTTP:</p>
+<pre><code>victim -> server   &lt;C: volume serial&gt;stealer;\n
+server -> victim   reply containing "auth_ok"   (no auth_ok: close, no upload)
+victim -> server   8-byte big-endian length + ZIP bytes
+victim             closesocket, then TerminateProcess(self, 0)</code></pre>
+      <p>The last step matters for defenders. After one upload it kills its own host process with exit code 0. It has no loop, no self-delete and no persistence of its own. Persistence belongs to the RAT. One caveat: the stealer calls <code>TerminateProcess</code> on its own process, so the RAT only survives if it ran the stealer in a separate process that it spawned or injected into. That fits the RAT's <code>CreateProcess</code> and injection imports, but I did not fully reverse the loader, so which process dies is an inference, not something I confirmed.</p>
+      <div class="callout"><b>correction:</b> my first draft said the upload port was 408. The number <code>0x198</code> in the decompiled code looked like a port, but it is the size of the <code>WSAStartup</code> buffer. The real port is 1488, which I confirmed from the string passed to <code>getaddrinfo</code> and from a connection attempt to that port that my lab firewall dropped. So 408 is where the RAT downloads modules and 1488 is where the stealer uploads loot.</div>
+
+      <h2>detection ideas</h2>
+      <p>These come from my analysis and I have not tested them against production telemetry.</p>
+      <ul>
+        <li><b>Defender exclusions:</b> alert on <code>Add-MpPreference -ExclusionPath</code> in PowerShell logs, and on exclusion changes for temp or <code>ProgramData</code> paths.</li>
+        <li><b>Masquerade:</b> the real <code>RuntimeBroker.exe</code> lives in <code>System32</code>. One under <code>ProgramData</code> is a strong signal.</li>
+        <li><b>Odd installer:</b> a game "installer" that is a Node.js single executable app, which the fuse marker above gives away.</li>
+        <li><b>Network:</b> outbound traffic to the C2 on 406, 408 or 1488, or raw TCP carrying a short line that ends in <code>stealer;</code>.</li>
+        <li><b>Browser kills:</b> a non-browser process force-closing every Chrome, Edge or Firefox instance moments before credential files are touched. The stealer does this to unlock their databases.</li>
+        <li><b>Mutexes:</b> <code>Global\StealerLib</code>, and <code>Global\RuntimeBrokerAds</code>, which the stealer checks for before it runs.</li>
+        <li><b>Behaviour:</b> an unsigned process opening the Microsoft Software Key Storage Provider and the <code>Google Chromekey1</code> key.</li>
+      </ul>
+
+      <h2>indicators</h2>
+      <table>
+        <thead><tr><th>type</th><th>value</th><th>note</th></tr></thead>
+        <tbody>
+          <tr><td>sha256</td><td><code>5ef0f27632fde67c2b8016465260dc473aac521e0a7fb4fbfaf4a69a8b66df97</code></td><td>Setup.zip</td></tr>
+          <tr><td>sha256</td><td><code>9747c283ada711b03c4ce294e37facd916126a246912048da2c5458717b24fb7</code></td><td>Setup.exe, Node.js dropper</td></tr>
+          <tr><td>sha256</td><td><code>c0858b52116a02191cce41a7a3ed68e6fa4f28b28da809e31e6e7d874eb9a9f8</code></td><td>RAT, carved from the dropper</td></tr>
+          <tr><td>sha256</td><td><code>b4260bdb4bb7b806bfe96f11ede6427ebd9817c2d1e141164c8c78a13078c196</code></td><td>stealer DLL, captured off the wire</td></tr>
+          <tr><td>domain</td><td><code>mopsikimilie[.]cc</code></td><td>registered about 3 days before I looked</td></tr>
+          <tr><td>ip</td><td><code>185[.]235[.]128[.]170</code></td><td>ports 406, 408, 1488 (3000 is a decoy)</td></tr>
+          <tr><td>campaign id</td><td><code>5197705037</code></td><td>also in the build path</td></tr>
+          <tr><td>path</td><td><code>C:\ProgramData\Windows\Microsoft\RuntimeBroker.exe</code></td><td>RAT install location</td></tr>
+          <tr><td>xor key</td><td><code>h8FVSyWSKo5Pz2ky2Yc9IebJV3wtSyvS</code></td><td>decrypts the embedded RAT</td></tr>
+          <tr><td>mutex</td><td><code>Global\StealerLib</code></td><td>stealer single-instance guard</td></tr>
+          <tr><td>alt name</td><td><code>respocket.zip</code></td><td>same campaign, different fake app</td></tr>
+        </tbody>
+      </table>
+      <p>On VirusTotal at the time, the domain was flagged by 8 of 92 vendors and <code>Setup.exe</code> by 4 of 69, and the zip had been uploaded only about 16 hours earlier. The RAT was not there, which fits it being an in-memory blob that nobody uploads.</p>
+
+      <h2>what I still do not know</h2>
+      <ul>
+        <li>What the collector on port 1488 does with the ZIP, and how it decides on <code>auth_ok</code>.</li>
+        <li>The full pool of tasks the operator can send, since I only ever saw the stealer task.</li>
+        <li>What the 403 gate on port 408 actually checks. I got the module by detonation, not by beating it.</li>
+      </ul>
+
+      <h2>takeaways</h2>
+      <blockquote>Most of my time went on wrong guesses, like AES for an XOR, a task list I read as per-victim that was really a broadcast, and a port that was a buffer size. Writing the corrections down mattered as much as the final answer.</blockquote>
+
+      <div class="post-nav">
+        <a href="../index.html#writeups">[ back to writeups ]</a>
+        <a href="#top">[ top ]</a>
+      </div>
+    </article>
+
+  </div>
+</main>
+
+<footer>
+  <span>homemade · ff_lixo1 · <time id="year">2026</time></span>
+</footer>
+
+<script src="../js/river.js" defer></script>
+<script src="../js/smooth.js" defer></script>
+</body>
+</html>
